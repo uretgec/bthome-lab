@@ -56,11 +56,20 @@ details.info{margin-top:12px;color:var(--mut);font-size:13px}details.info summar
 .how ol{padding-left:22px}.how li{padding:4px 6px;border-radius:4px}.how dt{font-weight:700;margin-top:8px}.how dd{margin:0 0 0 14px;color:var(--mut)}
 @keyframes fl{from{background:rgba(255,255,255,.55);outline:1px solid #fff}to{background:transparent;outline:1px solid transparent}}.fl{animation:fl 1.3s ease-out}
 .hl{background:rgba(255,255,255,.2)!important;outline:1px solid var(--mut)}.sec.hl{box-shadow:0 0 0 2px var(--mut)}
+.c-unp{color:var(--warn)}
+.seg button[aria-selected=true]{background:var(--bth);color:#0b0f14;border-color:var(--bth);font-weight:700}
+.sec.dec{border-left-color:#9aa}
+textarea{width:100%;min-height:150px;resize:vertical;font-size:14px}
+.strip{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}.strip span{border:1px solid var(--bd);border-radius:14px;padding:3px 12px}.strip .okc{color:var(--bth);border-color:var(--bth)}.strip .badc{color:var(--err);border-color:var(--err)}
+button.chip{border-radius:22px;padding:6px 16px}
+.tblwrap{overflow-x:auto}table.meas{width:100%;border-collapse:collapse;font-size:13px}table.meas th,table.meas td{border-bottom:1px solid var(--bd);padding:6px 8px;text-align:left;vertical-align:top}table.meas th{color:var(--mut);font-weight:600}
+#xferNote{background:rgba(79,209,224,.12);border:1px solid var(--enc);border-radius:6px;padding:8px 12px;margin:12px 18px 0}
 </style>
 </head>
 <body>
 <header>
   <h1 data-i18n="app.title"></h1>
+  <div class="seg" role="tablist" data-i18n-attr="aria-label:tab.label"><button type="button" role="tab" id="tabGen" data-tab="gen" aria-selected="true" aria-controls="panelGen" data-i18n="tab.gen"></button><button type="button" role="tab" id="tabDec" data-tab="dec" aria-selected="false" aria-controls="panelDec" data-i18n="tab.dec"></button></div>
   <div class="hr">
     <div class="seg" role="group" data-i18n-attr="aria-label:lang.label"><button type="button" data-lang="tr" aria-pressed="false">TR</button><button type="button" data-lang="en" aria-pressed="false">EN</button></div>
     <label class="sr" for="preset" data-i18n="preset.label"></label>
@@ -70,6 +79,8 @@ details.info{margin-top:12px;color:var(--mut);font-size:13px}details.info summar
   </div>
 </header>
 <pre id="report" hidden></pre>
+<div id="panelGen" role="tabpanel" aria-labelledby="tabGen">
+<div id="xferNote" role="status" hidden></div>
 <main>
 <div id="left">
 
@@ -144,7 +155,7 @@ details.info{margin-top:12px;color:var(--mut);font-size:13px}details.info summar
     <fieldset><legend class="sr" data-i18n="view.label"></legend>
       <div class="line"><label class="chk"><input type="radio" name="view" value="adv" checked><span data-i18n="view.adv"></span></label><label class="chk"><input type="radio" name="view" value="full"><span data-i18n="view.full"></span></label></div>
     </fieldset>
-    <div class="line"><button type="button" data-cp="adv" data-i18n="cp.adv"></button><button type="button" data-cp="full" data-i18n="cp.full"></button><button type="button" data-cp="svc" data-i18n="cp.svc"></button></div>
+    <div class="line"><button type="button" data-cp="adv" data-i18n="cp.adv"></button><button type="button" data-cp="full" data-i18n="cp.full"></button><button type="button" data-cp="svc" data-i18n="cp.svc"></button><button type="button" id="toDec" data-i18n="btn.toDec"></button></div>
     <div class="vh"><b data-i18n="out.hex"></b><label class="chk"><input type="checkbox" id="spaced"><span data-i18n="out.spaced"></span></label></div>
     <div class="box hex" id="hexView"></div>
     <div class="vh"><b data-i18n="out.pretty"></b><span class="fh"><span class="c-ad">■ <span data-i18n="legend.ad"></span></span> <span class="c-bth">■ <span data-i18n="legend.bth"></span></span> <span class="c-obj">■ <span data-i18n="legend.obj"></span></span> <span class="c-ll">■ <span data-i18n="legend.ll"></span></span> <span class="c-crc">■ <span data-i18n="legend.crc"></span></span> <span class="c-fix">■ <span data-i18n="legend.fix"></span></span> <span class="c-enc">■ <span data-i18n="legend.enc"></span></span> <span class="c-cnt">■ <span data-i18n="legend.ctr"></span></span> <span class="c-mic">■ <span data-i18n="legend.mic"></span></span></span></div>
@@ -155,6 +166,48 @@ details.info{margin-top:12px;color:var(--mut);font-size:13px}details.info summar
   </section>
 </div></div>
 </main>
+</div>
+
+<div id="panelDec" role="tabpanel" aria-labelledby="tabDec" hidden>
+<main>
+<div id="decLeft">
+  <section class="sec dec">
+    <h2 data-i18n="dec.title"></h2>
+    <label for="decIn" data-i18n="dec.input"></label>
+    <textarea id="decIn" class="mono" spellcheck="false" autocomplete="off" data-i18n-attr="placeholder:dec.ph"></textarea>
+    <div class="fh" id="decCount"></div>
+    <div class="line"><label for="decFmt" data-i18n="dec.fmt"></label><select id="decFmt"></select></div>
+    <div class="fh" id="decReason"></div>
+    <div id="decMacWrap" hidden>
+      <div class="line"><label for="decMac" data-i18n="dec.mac"></label><input type="text" id="decMac" class="mono" style="width:210px" spellcheck="false" autocomplete="off"></div>
+      <div class="fh" data-i18n="dec.mac.hint"></div><div class="msg err" id="decMsgMac" aria-live="polite"></div>
+    </div>
+    <div id="decKeyWrap" hidden>
+      <div class="line"><label for="decKey" data-i18n="dec.key"></label><input type="text" id="decKey" class="mono" style="flex:1;min-width:240px" spellcheck="false" autocomplete="off"></div>
+      <div class="fh" data-i18n="dec.key.hint"></div><div class="msg err" id="decMsgKey" aria-live="polite"></div>
+    </div>
+    <div class="line"><b data-i18n="dec.ex"></b>
+      <button type="button" class="chip" data-ex="plain" data-i18n="dec.ex.plain"></button><button type="button" class="chip" data-ex="enc" data-i18n="dec.ex.enc"></button><button type="button" class="chip" data-ex="full" data-i18n="dec.ex.full"></button></div>
+    <details class="info"><summary data-i18n="info.summary"></summary><div data-info="dec"></div></details>
+  </section>
+</div>
+<div id="decRight"><div class="stick">
+  <section class="sec out">
+    <h2 data-i18n="dec.result"></h2>
+    <div class="strip" id="decStrip"></div>
+    <div id="decErrors" aria-live="polite"></div><div id="decWarns"></div><div id="decHints"></div>
+    <div class="vh"><b data-i18n="dec.tree"></b></div>
+    <div class="box" id="decTree"></div>
+    <div class="vh"><b data-i18n="dec.meas"></b></div>
+    <div class="box tblwrap" id="decMeas"></div>
+    <div class="vh"><b data-i18n="dec.info"></b></div>
+    <div class="grid8" id="decBits"></div>
+    <div id="decCounter"></div>
+    <div class="line"><button type="button" id="decOpen" data-i18n="dec.open"></button><span class="fh" id="decOpenNote"></span></div>
+  </section>
+</div></div>
+</main>
+</div>
 
 <main style="padding-top:0"><section class="sec how" style="grid-column:1/-1">
   <h2 data-i18n="how.title"></h2>
