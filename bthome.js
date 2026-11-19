@@ -145,25 +145,44 @@
     return { id: o.id, bytes: [o.id, ...data], data, detail, name: d.name };
   }
 
-  // ---------- minimal decoder (objects only; used by self-test) ----------
-  function decode(a) {
-    const out = []; let i = 0;
+  // ---------- object walker (offset-aware; decode() and the Phase 5 decoder both use it) ----------
+  function walkObjects(a) {
+    const objs = [], order = []; let i = 0, prev = -1, stop = null;
     while (i < a.length) {
-      const id = a[i++], d = DEFS[id]; if (!d) throw new Error('Bilinmeyen id 0x' + hx(id));
-      let value;
+      const st0 = i, id = a[i], d = DEFS[id];
+      if (!d) { stop = { kind: 'unknown', offset: st0, id, rest: a.slice(st0) }; break; }
+      const fail = kind => { stop = { kind, offset: st0, id, rest: a.slice(st0) }; };
+      let value, raw = null, n = 0;
       switch (d.k) {
-        case 'num': value = Number((rd(a, i, d.t) * d.f).toFixed(dec(d.f))); i += tInfo(d.t).bits / 8; break;
-        case 'bin': case 'enum': value = a[i++]; break;
-        case 'ts': value = rd(a, i, 'u32'); i += 4; break;
-        case 'text': { const n = a[i++]; value = fromUtf8(a.slice(i, i + n)); i += n; break; }
-        case 'raw': { const n = a[i++]; value = toHex(a.slice(i, i + n)); i += n; break; }
-        case 'dimmer': value = { event: a[i], steps: a[i + 1] }; i += 2; break;
-        case 'cmd': { const n = a[i] & 0x1F, op = a[i + 1]; value = { op, steps: n ? a[i + 2] : 0 }; i += 2 + n; break; }
-        case 'fw': value = a.slice(i, i + d.n).reverse(); i += d.n; break;
+        case 'num': { const sz = tInfo(d.t).bits / 8; if (i + 1 + sz > a.length) { fail('trunc'); break; } raw = rd(a, i + 1, d.t); value = Number((raw * d.f).toFixed(dec(d.f))); n = 1 + sz; break; }
+        case 'bin': case 'enum': if (i + 1 >= a.length) { fail('trunc'); break; } value = a[i + 1]; n = 2; break;
+        case 'ts': if (i + 5 > a.length) { fail('trunc'); break; } value = rd(a, i + 1, 'u32'); n = 5; break;
+        case 'text': case 'raw': {
+          if (i + 1 >= a.length) { fail('trunc'); break; }
+          const len = a[i + 1]; if (i + 2 + len > a.length) { fail('badlen'); break; }
+          const body = a.slice(i + 2, i + 2 + len); value = d.k === 'text' ? fromUtf8(body) : toHex(body); n = 2 + len; break;
+        }
+        case 'dimmer': if (i + 3 > a.length) { fail('trunc'); break; } value = { event: a[i + 1], steps: a[i + 2] }; n = 3; break;
+        case 'cmd': {
+          if (i + 2 >= a.length) { fail('trunc'); break; }
+          const lb = a[i + 1], na = lb & 0x1F, op = a[i + 2];
+          if ((lb & 0xE0) || i + 3 + na > a.length || (op <= 2 && na !== 0) || (op >= 3 && op <= 4 && na !== 1)) { fail('badlen'); break; }
+          value = { op, steps: na ? a[i + 3] : 0 }; n = 3 + na; break;
+        }
+        case 'fw': if (i + 1 + d.n > a.length) { fail('trunc'); break; } value = a.slice(i + 1, i + 1 + d.n).reverse(); n = 1 + d.n; break;
       }
-      out.push({ id, value });
+      if (stop) break;
+      objs.push({ id, off: st0, n, bytes: a.slice(st0, st0 + n), raw, value, d });
+      if (id < prev) order.push({ id, prev, off: st0 });
+      prev = id; i += n;
     }
-    return out;
+    return { objs, stop, order };
+  }
+  // ---------- minimal decoder (used by the T5 roundtrip) ----------
+  function decode(a) {
+    const w = walkObjects(a);
+    if (w.stop) throw E(w.stop.kind === 'unknown' ? 'E_OBJ_UNKNOWN' : 'E_OBJ', { offset: w.stop.offset, id: w.stop.id, kind: w.stop.kind });
+    return w.objs.map(o => ({ id: o.id, value: o.value }));
   }
 
   // ---------- AES-128 (forward cipher only) + AES-CCM (RFC 3610, L=2, M=4, no AAD) ----------
@@ -359,6 +378,183 @@
     return { adv, full: { bytes: [0xAA, 0xD6, 0xBE, 0x89, 0x8E, ...pduBytes, ...cb], segs }, warns, hdr, mac };
   }
 
+  // ---------- decoder (Phase 5): pure parsing, codes + params only, no human text ----------
+  const hex6 = x => x.toString(16).toUpperCase().padStart(6, '0');
+  const pduName = ty => { const p = PDU.find(x => x[0] === ty); return p ? p[1] : 'PDU_' + ty; };
+  const isBth = e => e.ty === 0x16 && e.data.length >= 2 && e.data[0] === 0xD2 && e.data[1] === 0xFC;
+  function normalizeHex(input) {
+    const c = String(input || '').replace(/0x/gi, '').replace(/[\s:,\-]/g, '');
+    const bad = c.search(/[^0-9a-fA-F]/);
+    if (bad >= 0) return { err: { c: 'E_HEX_CHAR', a: { pos: bad >> 1, ch: c[bad] } } };
+    if (c.length % 2) return { err: { c: 'E_HEX_ODD', a: { pos: c.length >> 1 } } };
+    return { bytes: c ? c.match(/../g).map(x => parseInt(x, 16)) : [] };
+  }
+  function adWalk(b, start, end) {
+    const els = []; let o = start;
+    while (o < end) {
+      const len = b[o];
+      if (len === 0) return { els, err: { kind: 'zero', offset: o } };
+      if (o + 1 + len > end) return { els, err: { kind: 'overrun', offset: o } };
+      els.push({ o, len, ty: b[o + 1], data: b.slice(o + 2, o + 1 + len) });
+      o += 1 + len;
+    }
+    return { els, err: null };
+  }
+  function detectFormat(b) { // first match wins; null = unknown
+    const n = b.length;
+    if (n >= 16 && b[0] === 0xAA && b[1] === 0xD6 && b[2] === 0xBE && b[3] === 0x89 && b[4] === 0x8E) return { f: 'FULL_PACKET', pre: true, r: 'R_FULL_PRE' };
+    if (n >= 15 && b[0] === 0xD6 && b[1] === 0xBE && b[2] === 0x89 && b[3] === 0x8E) return { f: 'FULL_PACKET', pre: false, r: 'R_FULL_NOPRE' };
+    if (n >= 8 && b[1] === n - 2 && [0, 2, 4, 6].indexOf(b[0] & 0x0F) >= 0) return { f: 'PDU', r: 'R_PDU' };
+    if (n >= 2 && b[0] === 0xD2 && b[1] === 0xFC) return { f: 'SERVICE_DATA', r: 'R_SVC' };
+    const w = adWalk(b, 0, n);
+    if (!w.err && w.els.length && (w.els.some(isBth) || w.els.every(e => AD_TYPES[e.ty]))) return { f: 'ADV_DATA', r: w.els.some(isBth) ? 'R_ADV_BTH' : 'R_ADV_KNOWN' };
+    if ((b[0] >> 5) === 2) {
+      if (!(b[0] & 1) && !walkObjects(b.slice(1)).stop) return { f: 'BARE_PAYLOAD', r: 'R_BARE' };
+      if ((b[0] & 1) && n >= 9) return { f: 'BARE_PAYLOAD', r: 'R_BARE_ENC' };
+    }
+    if (w.err && w.els.length && AD_TYPES[w.els[0].ty]) return { f: 'ADV_DATA', r: 'R_ADV_PARTIAL' }; // broken capture: let the TLV error surface
+    return null;
+  }
+  const FORCED = { FULL: { f: 'FULL_PACKET', pre: true }, FULL_NOPRE: { f: 'FULL_PACKET', pre: false }, PDU: { f: 'PDU' }, SERVICE_DATA: { f: 'SERVICE_DATA' }, ADV_DATA: { f: 'ADV_DATA' }, BARE_PAYLOAD: { f: 'BARE_PAYLOAD' } };
+
+  function valueDisplay(o) {
+    const d = o.d, v = o.value;
+    switch (d.k) {
+      case 'num': return `${fmt(o.raw * d.f, d.f)}${d.u ? ' ' + d.u : ''}`;
+      case 'bin': return { c: 'v.bin', a: { v } };
+      case 'enum': return enName(d.en, v) !== null ? { c: 'd.enum', a: { id: d.id, v } } : { c: 'v.unk', a: { v } };
+      case 'ts': return new Date(v * 1000).toISOString().slice(0, 19) + 'Z';
+      case 'text': return v;
+      case 'raw': return v.length ? v.match(/../g).join(' ') : '';
+      case 'dimmer': return enName(DIM, v.event) !== null ? { c: 'd.dimmer', a: { ev: v.event, steps: v.steps } } : { c: 'v.unk', a: { v: v.event } };
+      case 'cmd': return enName(CMD, v.op) !== null ? { c: 'd.cmd', a: v.op >= 3 ? { op: v.op, steps: v.steps } : { op: v.op } } : { c: 'v.unk', a: { v: v.op } };
+      case 'fw': return v.join('.');
+    }
+  }
+
+  // opts: { format: 'auto'|FULL|FULL_NOPRE|PDU|SERVICE_DATA|ADV_DATA|BARE_PAYLOAD, mac: string, key: string }
+  function parseInput(input, opts) {
+    opts = opts || {};
+    const M = { mac: null, macFrom: null, txAdd: null, rxAdd: null, chSel: null, pduType: null, pduName: null, crcOk: null, counter: null, micOk: null,
+      deviceInfo: null, version: null, encrypted: false, trigger: false, flags: null, name: null, txPower: null, extraAd: 0, advLen: null, unparsed: false, hasLink: false };
+    const R = { state: 'idle', format: null, reason: null, bytes: [], segments: [], measurements: [], warnings: [], errors: [], hints: [], bth: null, meta: M };
+    const W = (c, a) => R.warnings.push({ l: 'warn', c, a: a || {} });
+    const Er = (c, a) => R.errors.push({ l: 'err', c, a: a || {} });
+    const seg = (s0, n0, layer, lvl, label, desc, hexo) => { const o = { s: s0, n: n0, layer, lvl, label, desc }; if (hexo != null) o.hex = hexo; R.segments.push(o); };
+    const raw = (s0, n0, lvl, arr) => { if (n0 > 0) seg(s0, n0, 'unp', lvl, { c: 'lbl.unparsed' }, { c: 'd.cu.raw', a: { n: n0, hex: toHex(arr, ' ') } }); };
+    const fail = () => { R.state = 'error'; R.segments.sort((x, y) => x.s - y.s); return R; };
+    const norm = normalizeHex(input);
+    if (norm.err) { R.errors.push(Object.assign({ l: 'err' }, norm.err)); return fail(); }
+    const b = R.bytes = norm.bytes, n = b.length;
+    if (!n) return R; // idle
+    let det = null;
+    if (opts.format && opts.format !== 'auto') { det = FORCED[opts.format] ? Object.assign({ r: 'R_MANUAL' }, FORCED[opts.format]) : null; } else det = detectFormat(b);
+    if (!det) { Er('E_UNKNOWN_FORMAT'); return fail(); }
+    R.format = det.f; R.reason = det.r;
+    const min = det.f === 'FULL_PACKET' ? (det.pre ? 16 : 15) : det.f === 'PDU' ? 8 : det.f === 'SERVICE_DATA' ? 3 : 1;
+    if (n < min) { Er('E_TOO_SHORT', { have: n, min }); return fail(); }
+    if (det.f === 'SERVICE_DATA' && !(b[0] === 0xD2 && b[1] === 0xFC)) { Er('E_SVC_UUID'); return fail(); }
+
+    let advMac = null;
+    // ----- BTHome layer: uuidAt (or -1), infoAt, end (exclusive) -----
+    function emit(w, base, pt) {
+      const seen = {};
+      w.objs.forEach(o => {
+        const d = o.d, vd = valueDisplay(o); seen[o.id] = (seen[o.id] || 0) + 1;
+        seg(base + o.off, o.n, 'obj', pt ? 2 : 1, { c: 'lbl.obj', a: { id: o.id } }, d.k === 'num' ? `${o.raw} × ${d.f} = ${vd}` : vd, pt ? toHex(o.bytes, ' ') : undefined);
+        R.measurements.push({ id: o.id, name: d.name, off: base + o.off, bytes: o.bytes, raw: o.raw, factor: d.k === 'num' ? d.f : null, unit: d.u || '', value: o.value, vt: vd, dup: seen[o.id], pt });
+      });
+      w.order.forEach(x => W('W_ORDER', { id: hx(x.id), prev: hx(x.prev), offset: base + x.off }));
+      if (w.stop) {
+        const so = base + w.stop.offset;
+        raw(so, w.stop.rest.length, pt ? 2 : 1, w.stop.rest);
+        if (pt) R.segments[R.segments.length - 1].hex = toHex(w.stop.rest, ' ');
+        if (w.stop.kind === 'unknown') { W('W_UNKNOWN_ID', { id: hx(w.stop.id), offset: so }); M.unparsed = true; }
+        else Er('E_OBJ', { id: hx(w.stop.id), offset: so, kind: w.stop.kind });
+      }
+    }
+    function bthLayer(uuidAt, infoAt, end) {
+      if (uuidAt >= 0) seg(uuidAt, 2, 'bth', 1, { c: 'lbl.uuid' }, { c: 'd.uuid' });
+      if (infoAt >= end) { Er('E_TOO_SHORT', { have: end - Math.max(uuidAt, 0), min: 3 }); return; }
+      const info = b[infoAt], ver = info >> 5, enc = !!(info & 1), trig = !!(info & 4);
+      M.deviceInfo = info; M.version = ver; M.encrypted = enc; M.trigger = trig;
+      seg(infoAt, 1, 'bth', 1, { c: 'lbl.info' }, { c: ver === 2 ? 'd.info' : 'd.infov', a: { v: hx(info), ver, enc, trig } });
+      R.bth = { present: true, ok: false };
+      const ps = infoAt + 1;
+      if (ver !== 2) { Er('E_VERSION', { v: ver }); raw(ps, end - ps, 1, b.slice(ps, end)); return; }
+      R.bth.ok = true;
+      const rsv = [1, 3, 4].filter(k => (info >> k) & 1);
+      if (rsv.length) W('W_RESERVED', { bits: rsv.map(k => 'bit' + k).join(', ') });
+      if (!enc) { emit(walkObjects(b.slice(ps, end)), ps, false); return; }
+      const pl = b.slice(ps, end);
+      if (pl.length < 8) { Er('E_ENC_SHORT', { have: pl.length }); raw(ps, pl.length, 1, pl); return; }
+      const cl = pl.length - 8, ct = pl.slice(0, cl), ctrB = pl.slice(cl, cl + 4), mic = pl.slice(cl + 4);
+      if (cl) seg(ps, cl, 'enc', 1, { c: 'lbl.ct' }, { c: 'd.ctx', a: { n: cl } });
+      seg(ps + cl, 4, 'cnt', 1, { c: 'lbl.ctr' }, { c: 'd.ctr', a: { n: 4 } });
+      seg(ps + cl + 4, 4, 'mic', 1, { c: 'lbl.mic' }, { c: 'd.mic' });
+      M.counter = rd(ctrB, 0, 'u32');
+      const macB = advMac || parseMac(opts.mac), key = parseKey(opts.key);
+      if (!advMac && macB) { M.mac = toHex(macB, ':'); M.macFrom = 'input'; }
+      if (!macB || !key) { R.hints.push({ l: 'info', c: 'H_ENC_NEED', a: { key: !key, mac: !macB } }); return; }
+      const d = ccmDecrypt(key, [...macB, 0xD2, 0xFC, info, ...ctrB], ct, mic);
+      M.micOk = d.ok;
+      if (!d.ok) { Er('E_MIC'); return; } // never expose plaintext when the MIC fails
+      emit(walkObjects(d.pt), ps, true);
+    }
+
+    // ----- link layer -----
+    let adStart = 0, adEnd = n, hasAd = det.f === 'ADV_DATA';
+    if (det.f === 'FULL_PACKET' || det.f === 'PDU') {
+      const full = det.f === 'FULL_PACKET'; let p = 0; M.hasLink = true;
+      if (full) { if (det.pre) { seg(0, 1, 'fix', 0, { c: 'lbl.pre' }, { c: 'd.pre' }); p = 1; } seg(p, 4, 'fix', 0, { c: 'lbl.aa' }, { c: 'd.aa' }); p += 4; }
+      const pduEnd = full ? n - 3 : n, h0 = b[p], h1 = b[p + 1], ty = h0 & 15, avail = pduEnd - (p + 2);
+      M.pduType = ty; M.pduName = pduName(ty); M.chSel = (h0 >> 5) & 1; M.txAdd = (h0 >> 6) & 1; M.rxAdd = (h0 >> 7) & 1;
+      seg(p, 1, 'll', 0, { c: 'lbl.h0' }, { c: 'd.h0x', a: { pdu: M.pduName, ch: M.chSel, tx: M.txAdd, rx: M.rxAdd } });
+      seg(p + 1, 1, 'll', 0, { c: 'lbl.h1' }, { c: 'd.h1', a: { n: Math.max(0, h1 - 6), len: h1 } });
+      if (h1 !== avail) W('W_LENFIELD', { declared: h1, actual: avail });
+      if ([0, 2, 4, 6].indexOf(ty) >= 0) {
+        const onair = b.slice(p + 2, p + 8); advMac = onair.slice().reverse(); M.mac = toHex(advMac, ':'); M.macFrom = 'advA';
+        seg(p + 2, 6, 'll', 0, { c: 'lbl.adva' }, { c: 'd.adva', a: { mac: M.mac, le: toHex(onair, ' ') } });
+        adStart = p + 8; adEnd = pduEnd; hasAd = true;
+      } else { W('W_PDU_UNSUP', { pdu: M.pduName }); raw(p + 2, avail, 0, b.slice(p + 2, pduEnd)); }
+      if (full) {
+        const got = b[n - 3] | (b[n - 2] << 8) | (b[n - 1] << 16), exp = crc24(b.slice(det.pre ? 5 : 4, n - 3));
+        M.crcOk = exp === got;
+        if (!M.crcOk) W('W_CRC', { exp: hex6(exp), got: hex6(got) });
+        seg(n - 3, 3, 'crc', 0, { c: 'lbl.crc' }, { c: 'd.crc', a: { v: hex6(got), on: toHex(b.slice(n - 3), ' ') } });
+      }
+    }
+
+    // ----- AD elements / service data / bare payload -----
+    if (hasAd) {
+      const w = adWalk(b, adStart, adEnd); let bthDone = false; M.advLen = adEnd - adStart;
+      if (M.advLen > 31) W('W_ADV_LEN', { n: M.advLen });
+      w.els.forEach(e => {
+        const ty = e.ty, total = e.len + 1;
+        if (isBth(e)) {
+          if (bthDone) { W('W_MULTI_BTH'); M.extraAd++; seg(e.o, total, 'ad', 0, { c: 'lbl.ad', a: { name: AD_TYPES[0x16], ty: hx(ty) } }, customDesc(ty, e.data)); return; }
+          bthDone = true; seg(e.o, 2, 'ad', 0, { c: 'lbl.svc' }, { c: 'd.len', a: { len: e.len } });
+          bthLayer(e.o + 2, e.o + 4, e.o + 1 + e.len); return;
+        }
+        if (ty === 0x01 && e.data.length === 1) { M.flags = e.data[0]; seg(e.o, total, 'ad', 0, { c: 'lbl.flags' }, { c: 'd.flags', a: { v: hx(M.flags), bits: [0, 1, 2, 3, 4].filter(i => (M.flags >> i) & 1) } }); return; }
+        if (ty === 0x08 || ty === 0x09) { const text = fromUtf8(e.data); M.name = { mode: ty === 8 ? 'short' : 'complete', text };
+          seg(e.o, total, 'ad', 0, { c: ty === 8 ? 'lbl.name.short' : 'lbl.name.complete' }, { c: 'd.name', a: { text, n: e.data.length } }); return; }
+        if (ty === 0x0A && e.data.length === 1) { const v = e.data[0] > 127 ? e.data[0] - 256 : e.data[0]; M.txPower = v; seg(e.o, total, 'ad', 0, { c: 'lbl.tx' }, `${v} dBm (sint8)`); return; }
+        M.extraAd++;
+        if (!AD_TYPES[ty]) W('W_AD_UNKNOWN', { ty: hx(ty), offset: e.o });
+        seg(e.o, total, 'ad', 0, AD_TYPES[ty] ? { c: 'lbl.ad', a: { name: AD_TYPES[ty], ty: hx(ty) } } : { c: 'lbl.adu', a: { ty: hx(ty) } }, customDesc(ty, e.data));
+      });
+      if (w.err) { Er('E_TLV', { offset: w.err.offset, kind: w.err.kind }); raw(w.err.offset, adEnd - w.err.offset, 0, b.slice(w.err.offset, adEnd)); }
+      if (!bthDone) W('W_NO_BTHOME');
+    } else if (det.f === 'SERVICE_DATA') bthLayer(0, 2, n);
+    else if (det.f === 'BARE_PAYLOAD') bthLayer(-1, 0, n);
+    else if (M.pduType !== null) W('W_NO_BTHOME');
+
+    R.segments.sort((x, y) => x.s - y.s); // stable: children keep insertion order after their parent
+    R.state = R.errors.length ? 'error' : 'ok';
+    return R;
+  }
+
   // ---------- self-tests ----------
   function selfTest() {
     const res = [];
@@ -400,8 +596,45 @@
       const a = JSON.stringify(decode(bytes)), b = JSON.stringify(xs);
       return { ok: a === b, detail: a === b ? 'n=' + xs.length : a };
     });
+    const T2HEX = '0201060B094449592D73656E736F720A16D2FC4002C40903BF13', T8HEX = 'AAD6BE898E4214A5808FE648540201060A16D2FC4002C40903BF130F28DB';
+    const T9HEX = '0201061216D2FC41E445F3C9962B332211006C7C4519', T9KEY = '231d39c1d7cc1ab1aee224cd096db932', T9MAC = '5448E68F80A5';
+    const msOf = r => r.measurements.map(m => m.id + ':' + m.value).join(',');
+    const codes = (r, k) => r[k].map(x => x.c);
+    t('T7', () => {
+      const r = parseInput(T2HEX), ms = msOf(r);
+      return { ok: r.format === 'ADV_DATA' && !r.errors.length && !!r.meta.name && r.meta.name.text === 'DIY-sensor' && ms === '2:25,3:50.55', detail: `${r.format} ${ms}` };
+    });
+    t('T8', () => {
+      const r = parseInput(T8HEX), m = r.meta, bad = parseInput(T8HEX.replace('03BF130F28DB', '03BF140F28DB'));
+      const ok = r.format === 'FULL_PACKET' && m.crcOk === true && m.mac === '54:48:E6:8F:80:A5' && m.txAdd === 1 && m.pduType === 2 && m.pduName === 'ADV_NONCONN_IND' && msOf(r) === '2:25,3:50.55'
+        && codes(bad, 'warnings').indexOf('W_CRC') >= 0 && bad.meta.crcOk === false && bad.measurements.length === 2;
+      return { ok, detail: `${m.mac} ${m.pduName} crc=${m.crcOk} | corrupt: ${codes(bad, 'warnings').join()}` };
+    });
+    t('T9', () => {
+      const o = { mac: T9MAC, key: T9KEY }, r = parseInput(T9HEX, o), bad = parseInput(T9HEX.replace('C9962B33', 'C9962A33'), o), nokey = parseInput(T9HEX, { mac: T9MAC });
+      const ok = r.meta.micOk === true && r.meta.counter === 1122867 && msOf(r) === '2:25.06,3:50.55'
+        && codes(bad, 'errors').indexOf('E_MIC') >= 0 && bad.measurements.length === 0 && bad.meta.micOk === false && !bad.segments.some(x => x.hex != null)
+        && !nokey.errors.length && codes(nokey, 'hints').indexOf('H_ENC_NEED') >= 0 && nokey.measurements.length === 0;
+      return { ok, detail: `mic=${r.meta.micOk} ctr=${r.meta.counter} ${msOf(r)} | tamper: ${codes(bad, 'errors').join()}` };
+    });
+    t('T10', () => {
+      const mixed = '0x02:01:06 0b09 4449592D73656e736F72,0A16-d2fc 4002C4 09\n03bf13', a = parseInput(T2HEX), b2 = parseInput(mixed);
+      const sig = r => JSON.stringify([r.format, msOf(r), r.meta.name]);
+      const odd = parseInput('020'), trunc = parseInput('02010609'), ver = parseInput('D2FC2002C409');
+      const sts = [
+        { info: 0, objs: [{ id: 2, value: 25 }, { id: 3, value: 50.55 }], nameMode: 'complete', name: 'DIY-sensor' },
+        { info: 4, objs: [{ id: 0, value: 1 }, { id: 0x3A, value: 1 }], nameMode: 'none', name: '' },
+        { info: 0, objs: [{ id: 1, value: 97 }, { id: 2, value: 21.5 }, { id: 2, value: 22 }, { id: 2, value: -3.25 }], nameMode: 'none', name: '' }];
+      const rt = sts.every(x => {
+        const r = parseInput(toHex(buildAdv(Object.assign({ flagsOn: true, flags: 6, autoSort: true }, x)).bytes));
+        return !r.errors.length && msOf(r) === x.objs.map(o => o.id + ':' + o.value).join(',');
+      });
+      const tr = trunc.errors.find(e => e.c === 'E_TLV'), ok = sig(a) === sig(b2) && a.state === 'ok' && odd.errors[0] && odd.errors[0].c === 'E_HEX_ODD'
+        && !!tr && tr.a.offset === 3 && codes(ver, 'errors').indexOf('E_VERSION') >= 0 && rt;
+      return { ok, detail: `norm=${sig(a) === sig(b2)} odd=${odd.errors[0] && odd.errors[0].c} tlv@${tr && tr.a.offset} ver=${codes(ver, 'errors').join()} roundtrip=${rt}` };
+    });
     return res;
   }
 
-  window.BTHome = { DEFS, GROUPS, BTN, DIM, CMD, FLAG_NAMES, hx, toHex, encodeObject, decode, buildAdv, buildPacket, parseKey, crc24, crcBytes, parseMac, PDU, adTypeDesc, rangeInfo, fmt, defaultValue, selfTest };
+  window.BTHome = { DEFS, GROUPS, BTN, DIM, CMD, FLAG_NAMES, hx, toHex, encodeObject, decode, buildAdv, buildPacket, parseKey, crc24, crcBytes, parseMac, PDU, adTypeDesc, rangeInfo, fmt, parseInput, defaultValue, selfTest };
 })();

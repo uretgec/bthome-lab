@@ -7,7 +7,7 @@
   const hex = B.hx, nv = v => (typeof v === 'number' && isFinite(v)) ? v : '';
   const u8len = s => new TextEncoder().encode(String(s)).length;
   const LINKS = { format: 'https://bthome.io/format/', enc: 'https://bthome.io/encryption/', assigned: 'https://www.bluetooth.com/specifications/assigned-numbers/', rfc: 'https://www.rfc-editor.org/rfc/rfc3610', core: 'https://www.bluetooth.com/specifications/specs/' };
-  const INFO_LINKS = { ll: ['core'], ad: ['assigned'], bth: ['format'], enc: ['enc', 'rfc'], out: ['format'] };
+  const INFO_LINKS = { ll: ['core'], ad: ['assigned'], bth: ['format'], enc: ['enc', 'rfc'], out: ['format'], dec: ['format', 'enc'] };
   const COMMON = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x21, 0x3A];
   const FIELD_OF = { 'w.mac': 'mac', 'w.enc.mac': 'mac', 'w.txadd': 'mac', 'w.enc.key': 'encKey', 'w.enc.ctr': 'encCtr', 'w.txrange': 'txVal',
     'w.cu.type': 'cuType', 'w.cu.hex': 'cuData', 'w.cu.long': 'cuData', 'w.cu.fcd2': 'cuData', 'w.namelong': 'name' };
@@ -36,6 +36,12 @@
       case 'd.dimmer': a.evn = t('enum.60.' + a.ev); break;
       case 'd.cmd': a.opn = t('enum.59.' + a.op); c = a.steps != null ? 'd.cmd.arg' : 'd.cmd.noarg'; break;
       case 'd.h0': a.txn = t(a.tx ? 'val.random' : 'val.public'); break;
+      case 'd.h0x': a.txn = t(a.tx ? 'val.random' : 'val.public'); break;
+      case 'd.infov': a.encn = t(a.enc ? 'val.yes' : 'val.no'); a.trign = t(a.trig ? 'val.yes' : 'val.no'); break;
+      case 'v.bin': return t(a.v ? 'v.on' : 'v.off');
+      case 'E_TLV': a.why = t('tlv.' + a.kind); break;
+      case 'E_OBJ': a.why = t('objerr.' + a.kind); break;
+      case 'H_ENC_NEED': a.need = t(a.key && a.mac ? 'need.both' : a.key ? 'need.key' : 'need.mac'); break;
       case 'd.info': a.encn = t(a.enc ? 'val.yes' : 'val.no'); a.trign = t(a.trig ? 'val.yes' : 'val.no'); break;
       case 'd.flags': a.names = a.bits.map(i => t('flag.' + i)).join(', ') || '—'; break;
       case 'd.cu.raw': if (!a.n) c = 'd.cu.empty'; break;
@@ -63,6 +69,7 @@
     document.querySelectorAll('[data-lang]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.lang === lang)));
   }
   function buildDyn() {
+    $('decFmt').innerHTML = ['auto', 'FULL', 'FULL_NOPRE', 'PDU', 'SERVICE_DATA', 'ADV_DATA', 'BARE_PAYLOAD'].map(v => `<option value="${v}">${esc(t('fmt.' + v))}</option>`).join('');
     $('pduType').innerHTML = B.PDU.map(p => `<option value="${p[0]}"${p[2] ? '' : ' disabled'}>${p[0]} ${p[1]}${p[2] ? '' : ' — ' + esc(t('pdu.unsupported'))}</option>`).join('');
     $('hdrGrid').innerHTML = [7, 6, 5, 4, 3, 2, 1, 0].map(b => `<div class="bit"><b>bit${b}</b><span class="bv" id="hb${b}">0</span><small>${esc(t('hb.' + b))}</small></div>`).join('');
     $('flagBits').innerHTML = [0, 1, 2, 3, 4].map(i => `<label class="chk"><input type="checkbox" data-bit="${i}"><span>bit${i} ${esc(t('flag.' + i))}</span></label>`).join('');
@@ -129,7 +136,9 @@
   $('preset').oninput = e => { const f = PRESETS[e.target.value]; e.target.value = ''; if (f) loadState(f()); };
   $('reset').onclick = () => loadState(PRESETS.p1());
   document.querySelectorAll('[data-lang]').forEach(b => { b.onclick = () => setLang(b.dataset.lang); });
-  function loadState(s) { st = s; prev = null; syncStatic(); buildRows(); update(); }
+  let xfer = null;
+  function renderXfer() { $('xferNote').hidden = !xfer; $('xferNote').textContent = xfer ? t(xfer.n ? 'xfer.skipped' : 'xfer.ok', { n: xfer.n }) : ''; }
+  function loadState(s, x) { st = s; xfer = x || null; prev = null; syncStatic(); buildRows(); update(); renderXfer(); }
   function setLang(l) { lang = l; saveLang(l); applyAll(); }
 
   // ---------- copy ----------
@@ -145,7 +154,7 @@
   function hl(e, on) {
     const el = e.target.closest && e.target.closest('[data-sid],[data-lbl],[data-seg]'); if (!el) return;
     let sel;
-    if (el.dataset.sid) sel = `[data-sid="${el.dataset.sid}"],.sec[data-seg="${el.dataset.seg}"]`;
+    if (el.dataset.sid) sel = `[data-sid="${el.dataset.sid}"]` + (el.dataset.seg ? `,.sec[data-seg="${el.dataset.seg}"]` : '');
     else if (el.dataset.lbl) sel = el.dataset.lbl.split(' ').map(c => `[data-lbl="${c}"]`).join(',');
     else sel = `[data-seg="${el.dataset.seg}"]`;
     document.querySelectorAll(sel).forEach(x => x.classList.toggle('hl', on));
@@ -223,6 +232,14 @@
   };
 
   // ---------- outputs ----------
+  function prettyHTML(segs, cur, changed, gen) {
+    return segs.map((s, k) => {
+      let any = false; for (let j = 0; j < s.n; j++) if (changed(s.s + j)) any = true;
+      const at = gen ? ` data-seg="${secOf(s)}" data-sid="s${k}" data-lbl="${s.label.c}"` : ` data-sid="d${k}"`;
+      const hx = s.hex != null ? s.hex : B.toHex(cur.slice(s.s, s.s + s.n), ' ');
+      return `<div class="pl l${s.lvl}"${at}><span class="c-${s.layer}${any ? ' fl' : ''}">${hx}</span>  <b>${esc(tx(s.label))}</b>  <span class="d">${esc(tx(s.desc))}</span></div>`;
+    }).join('');
+  }
   function update() {
     const p = B.buildPacket(st), r = p.adv;
     const shown = view === 'full' ? (p.full || { bytes: [], segs: [] }) : { bytes: r.bytes, segs: r.segs };
@@ -298,15 +315,13 @@
     if (iu >= 0) { let end = r.segs[iu].s; for (let k = iu; k < r.segs.length && ['bth', 'obj', 'enc', 'cnt', 'mic'].indexOf(r.segs[k].layer) >= 0; k++) end = r.segs[k].s + r.segs[k].n; svc = B.toHex(r.bytes.slice(r.segs[iu].s, end)); }
     copyTxt.svc = svc;
     document.querySelectorAll('[data-cp]').forEach(b => { b.disabled = !copyTxt[b.dataset.cp]; });
+    $('toDec').disabled = !(view === 'full' ? copyTxt.full : copyTxt.adv);
 
     // three synchronized views of the same bytes
     const empty = `<span class="fh">${esc(view === 'full' ? t('out.nofull') : t('out.empty'))}</span>`;
     const span = i => `<span class="b c-${layer(i)}${changed(i) ? ' fl' : ''}"${attrs(i)}>${hex(cur[i])}</span>`;
     $('hexView').innerHTML = len ? cur.map((_, i) => span(i)).join('') : empty;
-    $('pretty').innerHTML = shown.segs.map((s, k) => {
-      let any = false; for (let j = 0; j < s.n; j++) if (changed(s.s + j)) any = true;
-      return `<div class="pl l${s.lvl}" data-seg="${secOf(s)}" data-sid="s${k}" data-lbl="${s.label.c}"><span class="c-${s.layer}${any ? ' fl' : ''}">${B.toHex(cur.slice(s.s, s.s + s.n), ' ')}</span>  <b>${esc(tx(s.label))}</b>  <span class="d">${esc(tx(s.desc))}</span></div>`;
-    }).join('') || empty;
+    $('pretty').innerHTML = prettyHTML(shown.segs, cur, changed, true) || empty;
     let dump = '';
     for (let o = 0; o < len; o += 16) {
       let hs = '', asc = '';
@@ -320,7 +335,72 @@
     prev = cur.slice();
   }
 
-  // ---------- tests (T1–T5 from the engine, T6 i18n parity here) ----------
+  // ---------- decoder tab (state lives here, never reset by tab switches) ----------
+  const EXAMPLES = {
+    plain: { text: '0201060B094449592D73656E736F720A16D2FC4002C40903BF13', mac: '', key: '' },
+    enc: { text: '0201061216D2FC41E445F3C9962B332211006C7C4519', mac: '54:48:E6:8F:80:A5', key: '231d39c1d7cc1ab1aee224cd096db932' },
+    full: { text: 'AAD6BE898E4214A5808FE648540201060A16D2FC4002C40903BF130F28DB', mac: '', key: '' }
+  };
+  const dec = { text: '', fmt: 'auto', mac: '', key: '' };
+  let decRes = null;
+  function setTab(n) {
+    $('panelGen').hidden = n !== 'gen'; $('panelDec').hidden = n !== 'dec';
+    document.querySelectorAll('[data-tab]').forEach(b => b.setAttribute('aria-selected', String(b.dataset.tab === n)));
+  }
+  function decSync() { $('decIn').value = dec.text; $('decFmt').value = dec.fmt; $('decMac').value = dec.mac; $('decKey').value = dec.key; }
+  function decUpdate() {
+    const r = decRes = B.parseInput(dec.text, { format: dec.fmt, mac: dec.mac, key: dec.key }), m = r.meta;
+    $('decCount').textContent = t('dec.count', { n: r.bytes.length });
+    $('decReason').textContent = r.format ? t('dec.detected', { fmt: t('fmt.' + r.format), why: t('reason.' + r.reason) }) : '';
+    const needMac = m.encrypted && m.macFrom !== 'advA';
+    $('decMacWrap').hidden = !needMac; $('decKeyWrap').hidden = !m.encrypted;
+    const macBad = needMac && dec.mac.trim() !== '' && !B.parseMac(dec.mac), keyBad = m.encrypted && dec.key.trim() !== '' && !B.parseKey(dec.key);
+    $('decMsgMac').textContent = macBad ? t('w.mac') : ''; $('decMac').classList.toggle('bad', !!macBad);
+    $('decMsgKey').textContent = keyBad ? t('w.enc.key') : ''; $('decKey').classList.toggle('bad', !!keyBad);
+    $('decIn').classList.toggle('bad', r.errors.some(e => e.c === 'E_HEX_ODD' || e.c === 'E_HEX_CHAR'));
+    const mark = v => v === true ? '✓' : v === false ? '✗' : '—', cls = v => v === true ? 'okc' : v === false ? 'badc' : '';
+    $('decStrip').innerHTML = `<span>${esc(t('dec.status.fmt'))}: ${esc(r.format ? t('fmt.' + r.format) : '—')}</span><span class="${cls(m.crcOk)}">${esc(t('dec.status.crc'))} ${mark(m.crcOk)}</span><span class="${cls(m.micOk)}">${esc(t('dec.status.mic'))} ${mark(m.micOk)}</span>`;
+    const li = (arr, c) => arr.map(x => `<div class="w ${c}">${esc(tx(x))}</div>`).join('');
+    $('decErrors').innerHTML = li(r.errors, 'err'); $('decWarns').innerHTML = li(r.warnings, 'warn'); $('decHints').innerHTML = li(r.hints, 'info');
+    $('decTree').innerHTML = prettyHTML(r.segments, r.bytes, () => false, false) || `<span class="fh">${esc(t('dec.idle'))}</span>`;
+    $('decMeas').innerHTML = r.measurements.length ? `<table class="meas"><thead><tr><th>${esc(t('col.name'))}</th><th>${esc(t('col.bytes'))}</th><th>${esc(t('col.raw'))}</th><th>${esc(t('col.factor'))}</th><th>${esc(t('col.value'))}</th></tr></thead><tbody>` +
+      r.measurements.map(x => `<tr><td>0x${hex(x.id)} ${esc(t('obj.' + x.id + '.name'))}${x.dup > 1 ? '_' + x.dup : ''}</td><td class="mono">${B.toHex(x.bytes, ' ')}</td><td class="mono">${x.raw != null ? x.raw : '—'}</td><td class="mono">${x.factor != null ? '× ' + x.factor : '—'}</td><td>${esc(tx(x.vt))}</td></tr>`).join('') + '</tbody></table>'
+      : `<span class="fh">${esc(t('dec.meas.none'))}</span>`;
+    $('decBits').innerHTML = m.deviceInfo == null ? '' : [7, 6, 5, 4, 3, 2, 1, 0].map(k => `<div class="bit${k >= 5 ? ' lock' : ''}"><b>bit${k}</b><span class="bv">${(m.deviceInfo >> k) & 1}</span><small>${esc(t('bit.' + k))}</small></div>`).join('');
+    $('decCounter').innerHTML = m.counter != null ? `<div class="mono" style="margin-top:8px">${esc(t('dec.counter', { n: m.counter }))}</div><div class="fh">${esc(t('dec.replay'))}</div>` : '';
+    const can = !!(r.bth && r.bth.ok && (!m.encrypted || m.micOk === true));
+    $('decOpen').disabled = !can; $('decOpenNote').textContent = can ? '' : t(r.bth && r.bth.ok ? 'dec.open.na.enc' : 'dec.open.na.bth');
+  }
+  // one-shot mapping decoder result -> generator state (no live sync)
+  function genFromDecode(r) {
+    const m = r.meta, g = base();
+    g.flagsOn = m.flags != null; g.flags = m.flags != null ? m.flags & 0x1F : 6;
+    g.nameMode = m.name ? m.name.mode : 'none'; g.name = m.name ? m.name.text : '';
+    g.txPower = m.txPower != null ? { on: true, val: m.txPower } : { on: false, val: 0 };
+    g.info = m.deviceInfo & 0x1F; g.autoSort = !r.warnings.some(w => w.c === 'W_ORDER');
+    g.objs = r.measurements.map(x => ({ id: x.id, value: JSON.parse(JSON.stringify(x.value)) }));
+    if (m.mac) g.mac = m.mac;
+    if (m.txAdd != null) g.txAdd = m.txAdd;
+    let skipped = m.extraAd + (m.unparsed ? 1 : 0);
+    if (m.pduType != null) { if ([0, 2, 6].indexOf(m.pduType) >= 0) g.pduType = m.pduType; else skipped++; }
+    if (m.encrypted) { g.enc.key = dec.key.replace(/[\s:]/g, '').toLowerCase(); g.enc.counter = m.counter; }
+    return { g, skipped };
+  }
+  $('decIn').oninput = e => { dec.text = e.target.value; decUpdate(); };
+  $('decFmt').oninput = e => { dec.fmt = e.target.value; decUpdate(); };
+  $('decMac').oninput = e => { dec.mac = e.target.value; decUpdate(); };
+  $('decKey').oninput = e => { dec.key = e.target.value; decUpdate(); };
+  document.querySelectorAll('[data-ex]').forEach(b => { b.onclick = () => { Object.assign(dec, { fmt: 'auto' }, EXAMPLES[b.dataset.ex]); decSync(); decUpdate(); }; });
+  document.querySelectorAll('[data-tab]').forEach(b => { b.onclick = () => setTab(b.dataset.tab); });
+  $('decOpen').onclick = () => { if (!decRes || $('decOpen').disabled) return; const x = genFromDecode(decRes); loadState(x.g, { n: x.skipped }); setTab('gen'); };
+  $('toDec').onclick = () => {
+    const text = view === 'full' ? copyTxt.full : copyTxt.adv; if (!text) return;
+    dec.text = text; dec.fmt = 'auto';
+    if (st.info & 1) { dec.mac = st.mac; dec.key = st.enc.key; } // convenience: an encrypted output needs both to decode
+    decSync(); decUpdate(); setTab('dec');
+  };
+
+  // ---------- tests (T1–T5, T7–T10 from the engine; T6 i18n parity here) ----------
   function parityTest() {
     const en = Object.keys(STR.en), tr = Object.keys(STR.tr), miss = [];
     en.forEach(k => { if (!(k in STR.tr)) miss.push('tr:' + k); });
@@ -329,7 +409,7 @@
     Object.keys(B.DEFS).forEach(id => ['en', 'tr'].forEach(L => { if (!STR[L]['obj.' + id + '.name']) miss.push(L + ':obj.' + id + '.name'); }));
     return { id: 'T6', ok: !miss.length, detail: miss.length ? miss.slice(0, 6).join(', ') : en.length + ' keys, ' + Object.keys(B.DEFS).length + ' objects' };
   }
-  const tests = B.selfTest().concat([parityTest()]);
+  const tests = B.selfTest().concat([parityTest()]).sort((x, y) => +x.id.slice(1) - +y.id.slice(1));
   function renderBadge() {
     const okN = tests.filter(x => x.ok).length, all = okN === tests.length;
     $('badge').textContent = t('badge.tests', { n: okN, total: tests.length, mark: all ? '✓' : '✗' });
@@ -338,7 +418,7 @@
   }
   $('badge').onclick = () => { $('report').hidden = !$('report').hidden; };
 
-  function applyAll() { applyStatic(); buildDyn(); syncStatic(); buildRows(); renderBadge(); update(); }
+  function applyAll() { applyStatic(); buildDyn(); syncStatic(); buildRows(); renderBadge(); update(); decSync(); decUpdate(); renderXfer(); }
   lang = initLang();
   applyAll();
 })();
