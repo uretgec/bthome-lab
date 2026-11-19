@@ -9,6 +9,8 @@ every byte change as you type:
 
 `link layer → AD elements → BTHome v2 service data → measurements → AES-CCM → CRC-24`
 
+![Main Screen](docs/screenshots/bthome_v2_generator.png)
+
 ## Features
 
 - Full packet anatomy: PDU header, public/random MAC, Flags, Local Name, TX power, custom AD
